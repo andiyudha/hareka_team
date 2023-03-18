@@ -11,7 +11,6 @@ library(googlesheets4)
 # read data from gdrive ---------------------------------------------------
 
 # Authenticate with Google Drive API
-drive_auth()
 gs4_auth()
 
 # Download the file from Google Drive
@@ -89,5 +88,9 @@ drive_auth()
 # Define the name of the Google Sheets file and the folder ID
 folder_id <- "1jU5SuhAkHMNno1Fx-XqgJx26PBdABCW5"
 
-df_predicted %>%
-drive_upload(name = "pred_fire.csv", type = "spreadsheet", overwrite = TRUE)
+# Write the data frame to a temporary file
+temp_file <- tempfile()
+write.csv(df_predicted, file = temp_file, row.names = FALSE)
+
+# Upload the file to Google Drive and add it to the target folder
+drive_upload(temp_file, name = "pred_fire.csv", type = "csv", parents = folder_id, overwrite = TRUE)
