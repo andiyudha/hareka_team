@@ -1,0 +1,304 @@
+---
+title: "01_modeling_smoke"
+author: "HAREKA TEAM"
+date: "2023-03-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+## Modeling Smoke Detection to Fire Alarm Prediction
+
+Smoke detection prediction with dataset from https://www.kaggle.com/datasets/deepcontractor/smoke-detection-dataset with classification model in R Programming language
+
+Used for Balikpapan Hackathon 2023
+
+
+## Load Library
+
+Load library that will use in this model
+
+
+```{r library}
+library(tidyverse)
+library(caret)
+library(C50)
+library(rpart.plot)
+library(odbc)
+library(RPostgres)
+library(corrplot)
+library(ggcorrplot)
+library(RColorBrewer)
+library(hrbrthemes)
+```
+
+## Read Data & Wrangling dataset
+
+Read dataset from Database PostgreSQL
+
+```{r to PostgreSQL, message=FALSE}
+pg_con <- dbConnect(
+  Postgres(),
+  host = "rosie.db.elephantsql.com",
+  port = 5432,
+  dbname = "qnkipzon",
+  user = "qnkipzon",
+  password = "K-BYc1HQmPQKLHGGiJquQNWGcluKKuZ0"
+)
+```
+
+
+```{r to PostgreSQL, message=FALSE, warning=FALSE}
+
+dbListTables(pg_con) # check tables in database
+
+```
+
+Open connection to PostgreSQL to get the data and send query to server
+
+```{r, warning=FALSE}
+res <-
+dbSendQuery(
+  pg_con,
+  'SELECT * FROM smoke_detection'
+)
+
+```
+
+```{r, warning=FALSE}
+raw_data <- dbFetch(res) # create data table in R from database
+
+raw_data
+```
+
+# Missing data
+
+Check missing data on object datase
+
+```{r, warning=FALSE}
+
+raw_df %>%
+  summarise_all(~ sum(is.na(.)))
+
+```
+Found that no missing dataset in object & we can perform data processing for these dataset
+
+# Dataset consists of variables:
+
+1. UTC: Time when experiment was performed
+2. Temperature[C]: Temperature of surroundings, measured in celcius
+3. Humidity[%]: Air humidity during the experiment
+4. TVOC[ppb]: Total Volatile Organic Compounds, measured in ppb (parts per billion)
+5. eCO2[ppm]: CO2 equivalent concentration, measured in ppm (parts per million)
+6. Raw H2: The amount of Raw Hydrogen [Raw Molecular Hydrogen; not compensated (Bias, Temperature etc.)] present in surroundings
+7. Raw Ethanol: The amount of Raw Ethanol present in surroundings
+8. Pressure[hPa]: Air pressure, Measured in hPa
+9. PM1.0: Paticulate matter of diameter less than 1.0 micrometer
+10. PM2.5: Paticulate matter of diameter less than 2.5 micrometer
+11. NC0.5: Concentration of particulate matter of diameter less than 0.5 micrometer
+12. NC1.0: Concentration of particulate matter of diameter less than 1.0 micrometer
+13. NC2.5: Concentration of particulate matter of diameter less than 2.5 micrometer
+14. CNT: Sample Count. Fire Alarm(Reality) If fire was present then value is 1 else it is 0
+15. Fire Alarm: 1 means Positive and 0 means Not Positive
+
+```{r, warning=FALSE}
+glimpse(raw_data)
+```
+After download data and get query, close connection with database
+```{r close connection with PostgreSQL, warning=FALSE}
+
+dbClearResult(res)
+
+# Close connection with PostGreSQL
+dbDisconnect(pg_con)
+```
+
+# Data processing
+
+Processing dataset before doing a modeling. Selecting the variables that needed & unselect variable CNT, Sample Count.
+
+```{r, warning=FALSE}
+raw_data %>%
+  select(
+         temp_c = `Temperature[C]`,
+         humidity = `Humidity[%]`,
+         tvoc = `TVOC[ppb]`,
+         co2 = `eCO2[ppm]`,
+         h2 = `Raw H2`,
+         ethanol = `Raw Ethanol`,
+         pressure = `Pressure[hPa]`,
+         pm1 = PM1.0,
+         pm2_5 = PM2.5,
+         fire_alarm = `Fire Alarm`
+         ) %>%
+  mutate(
+    fire_alarm = factor(fire_alarm, levels = c(1,0), labels = c("yes", "no"))
+  ) %>%
+  glimpse() -> df_data
+
+```
+
+# Correlation plot
+
+```{r}
+
+df_data %>%
+  mutate(
+    fire_alarm = case_when(
+      fire_alarm == "yes" ~ 1,
+      fire_alarm == "no" ~ 0,
+    )
+  ) %>%
+  cor() %>%
+  corrplot(method = "color",
+           type = "lower",
+           tl.col = "black", tl.srt = 1,
+           addCoef.col = "black",
+           number.cex = 0.6,
+           col=brewer.pal(n=8, name="RdYlBu"),
+           title = "Correlation variable on Smoke Detection",
+           mar=c(1,0,1,1))
+
+```
+
+**Insight**
+1. There is not any high correlation between target feature and other features. Small positive correlation between target **feature** and **Humidity**, **Pressure**. Small negative correlation between target feature and *TVOC*, *Raw Ethanol*.
+2. High positive correlation between eCO2 and TVOC, PM1.0. Pressure and Humidity. Raw H2 and Raw Ethanol. PM1.0 and eCO2, PM2.5.
+
+
+# Splitting data
+
+Splitting data into train and test dataset with proportion 80:20, Usually you'll get more accurate models the bigger that dataset you're training on, but more training data also leads to models taking longer to train.
+
+To split our data, we're going to use the createDataPartition() from the caret package. The function randomly samples the a proportion of the indexes of a vector you pass it. Then you can use those indexes to subset your full dataset into testing and training datasets.
+
+```{r, message=FALSE, warning=FALSE}
+# set random number
+set.seed(123)
+
+# splitiing data
+train_index <- createDataPartition(df_data$fire_alarm, times = 1, p = 0.8, list = FALSE)
+
+train_data <- df_data[train_index, ] %>% glimpse
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+# test data
+
+test_data <- df_data[-train_index, ] %>% glimpse()
+```
+
+# Modeling
+
+10-fold cross-validation is set up with createFolds and trainControl. The first one splits the training set into ten folds, and the second one specifies cross-validation using the folds. Typically, a simple trainControl (method="cv", k=10) would suffice, but the result may be different every time the command is executed. While trainControl provides a seed parameter for reproducibility, I had trouble setting it up and decided to use createFolds.
+
+
+
+```{r, message=FALSE, warning=FALSE}
+# 10-folds
+fold_index <- createFolds(train_data$fire_alarm,
+                          # number of folds
+                          k = 10, 
+                          # return as list
+                          list = T, 
+                          # return numbers corresponding positions
+                          returnTrain = T)
+
+# Cross validation
+ctrl <- trainControl(method="cv", index = fold_index)
+```
+# Train Model
+
+The train function streamlines the model building and evaluation process. Using neural network (NN) model
+
+For nn, there is only one tuning parameter, k. I have three options for tuning:
+
+1. Doing nothing: in this case, train tries 3 random numbers for k. While I say random, it’s actually not. But it’s outside of the scope of my project.
+2. tuneGrid: I specify the numbers to try, seq(2, 20, 1), a sequence of number from 2 to 20 with an interval of 1.
+3. tuneLength: Instead of providing numbers, I specify the function to try 10 different numbers. It can be 1–10, 101–110, or ten even numbers.
+
+The form parameter tells the model the target variable and the predictors. It looks like outcome ~ var1 + var2. Here I used . as wide card, allowing the model to select input variables. Lastly, as mentioned earlier, I used 10-fold cross-validation to evaluate the model, which is done with trControl.
+
+```{r, message=FALSE, warning=FALSE}
+# Option 1: No specification on tuning parameter
+m_c5 <- train(form = fire_alarm~.,
+               data = train_data,
+               method = 'C5.0',
+               trControl = ctrl,
+              trace = FALSE)
+# print model neural network
+print(m_c5)
+```
+
+```{r, message=FALSE, warning=FALSE}
+
+# Option 2: Try expand grid
+# 
+grid <- expand.grid( .winnow = c(TRUE,FALSE), .trials=c(1,5,10,15,20), .model="tree" )
+
+m_c5_2 <- train(form = fire_alarm~.,
+               data = train_data,
+               method = 'C5.0',
+               trControl = ctrl, # Cross-validation
+               tuneGrid = grid,
+               trace = FALSE)
+
+# print model
+print(m_c5_2)
+
+```
+
+```{r}
+# Plotting cross-validation each model
+
+plot(m_c5, main = "Decision Tree with 10-fold Cross-Validation: No specification on tuning parameter")
+```
+
+
+```{r}
+plot(m_c5_2, main = "Decision Tree with 10-fold Cross-Validation: with tuneGrid")
+```
+
+based on running the Decision Tree model find that Model with Tuning Grid is high Accuracy with 0.9997805.
+
+# Test the Model
+
+Testing the model is straightforward: predicting the target variable and evaluating the result.
+
+```{r}
+
+predict_c52 <- predict(m_c5_2, newdata = test_data)
+
+# Confusion Matrix
+tbl_c52 <- confusionMatrix(predict_c52, test_data$fire_alarm)
+
+tbl_c52
+```
+```{r}
+predict_c5 <- predict(m_c5, newdata = test_data)
+
+# Confusion Matrix
+tbl_c5 <- confusionMatrix(predict_c5, test_data$fire_alarm)
+
+tbl_c5
+```
+
+
+Based on 2 options, found that Option number 1 with tuneGrid has high accuracy with 0.9998.
+
+```{r}
+
+importance_c5 <- varImp(m_c5, scale=FALSE)
+plot(importance_c5, main = "Importance Variable in Smoke Detection with Decision Tree")
+```
+
+
+# Save the Model
+```{r}
+# save the model to disk
+saveRDS(m_c5, "./dectree_model.rds")
+```
+
